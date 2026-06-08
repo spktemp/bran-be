@@ -1,14 +1,14 @@
 # Node.js Backend with Meltwater Social APIs
 
 Backend service with versioned + language-compatible APIs (`/:lang/v1`) that fetch, normalize,
-store, and aggregate Instagram + LinkedIn + YouTube + Facebook performance data from Meltwater into SQL Server.
+store, and aggregate Instagram + LinkedIn + YouTube + Facebook performance data from Meltwater into PostgreSQL.
 
 ## Features
 
 - Node.js + Express + TypeScript
 - API versioning + language prefix (`/en/v1/...`)
 - Meltwater integration for Instagram, LinkedIn, YouTube, and Facebook ingestion
-- SQL Server persistence with Prisma ORM
+- PostgreSQL persistence with Prisma ORM
 - Metric aggregation for:
   - Mentions
   - Estimated Views (impressions)
@@ -28,7 +28,7 @@ Base pattern:
 Instagram APIs:
 
 - `POST /en/v1/instagram/sync`
-  - Fetches from Meltwater, normalizes, and upserts into SQL Server
+  - Fetches from Meltwater, normalizes, and upserts into PostgreSQL
   - Optional body:
     ```json
     {
@@ -45,7 +45,7 @@ Instagram APIs:
 LinkedIn APIs:
 
 - `POST /en/v1/linkedin/sync`
-  - Fetches from Meltwater, normalizes, and upserts into SQL Server
+  - Fetches from Meltwater, normalizes, and upserts into PostgreSQL
 - `GET /en/v1/linkedin/aggregate?from=...&to=...`
   - Returns aggregated metrics and sentiment split
 - `GET /en/v1/linkedin/records?from=...&to=...`
@@ -54,7 +54,7 @@ LinkedIn APIs:
 YouTube APIs:
 
 - `POST /en/v1/youtube/sync`
-  - Fetches from Meltwater, normalizes, and upserts into SQL Server
+  - Fetches from Meltwater, normalizes, and upserts into PostgreSQL
 - `GET /en/v1/youtube/aggregate?from=...&to=...`
   - Returns aggregated metrics and sentiment split
 - `GET /en/v1/youtube/records?from=...&to=...`
@@ -63,7 +63,7 @@ YouTube APIs:
 Facebook APIs:
 
 - `POST /en/v1/facebook/sync`
-  - Fetches from Meltwater, normalizes, and upserts into SQL Server
+  - Fetches from Meltwater, normalizes, and upserts into PostgreSQL
 - `GET /en/v1/facebook/aggregate?from=...&to=...`
   - Returns aggregated metrics and sentiment split
 - `GET /en/v1/facebook/records?from=...&to=...`
@@ -79,7 +79,7 @@ cp .env.example .env
 
 Required:
 
-- `DATABASE_URL` - SQL Server connection string
+- `DATABASE_URL` - PostgreSQL connection string
 - `MELTWATER_BASE_URL` - Meltwater API host URL
 - `MELTWATER_API_KEY` - Meltwater API token (sent as `apikey` header)
 - `MELTWATER_OWNED_POSTS_ENDPOINT` - Meltwater owned posts endpoint

@@ -621,7 +621,7 @@ export async function createResourceService(input: {
   notes?: string;
   requestedByUserId?: string;
 }) {
-  const node = await loadNodeOrThrow(input.nodeId);
+  await loadNodeOrThrow(input.nodeId);
   const sourceType = (input.sourceType ?? "IN_HOUSE") as ResourceSourceType;
   assertEnum(RESOURCE_SOURCE_TYPES, sourceType, "resource sourceType");
 

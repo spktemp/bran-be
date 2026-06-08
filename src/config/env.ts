@@ -15,17 +15,14 @@ function buildDatabaseUrlFromParts(): string {
   const dbName = process.env.DB_NAME;
   const user = process.env.DB_USER;
   const password = process.env.DB_PASSWORD;
-  const encrypt = process.env.DB_ENCRYPT ?? "true";
-  const trustServerCertificate = process.env.DB_TRUST_SERVER_CERTIFICATE ?? "true";
 
   if (!host || !dbPort || !dbName || !user || !password) {
     return "";
   }
 
   return (
-    `sqlserver://${host}:${dbPort};database=${dbName};` +
-    `user=${encodeURIComponent(user)};password=${encodeURIComponent(password)};` +
-    `encrypt=${encrypt};trustServerCertificate=${trustServerCertificate}`
+    `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}` +
+    `@${host}:${dbPort}/${encodeURIComponent(dbName)}`
   );
 }
 
@@ -85,6 +82,11 @@ export const env = {
   ideaMatchThreshold: parsePositiveNumber(process.env.IDEA_MATCH_THRESHOLD, 0.6),
   ideaMatchMaxRecommendations: parsePositiveNumber(process.env.IDEA_MATCH_MAX_RECOMMENDATIONS, 5),
   ideaNotifyThreshold: parsePositiveNumber(process.env.IDEA_NOTIFY_THRESHOLD, 0.75),
+  aiQueryCacheTtlMinutes: parsePositiveNumber(process.env.AI_QUERY_CACHE_TTL_MINUTES, 10),
+  aiQueryCacheSemanticThreshold: parsePositiveNumber(
+    process.env.AI_QUERY_CACHE_SEMANTIC_THRESHOLD,
+    0.92
+  ),
   apifyToken: process.env.APIFY_TOKEN ?? "",
   apifyInstagramActorId: process.env.APIFY_INSTAGRAM_ACTOR_ID ?? "apify/instagram-post-scraper",
   youtubeApiKey: process.env.YOUTUBE_API_KEY ?? "",

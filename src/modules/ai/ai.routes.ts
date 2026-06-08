@@ -3,9 +3,10 @@ import multer from "multer";
 import { z } from "zod";
 
 import { HttpError } from "../../utils/httpError";
+import { param } from "../../utils/param";
 import { authenticate } from "../auth/auth.middleware";
 import { requirePermission } from "../auth/auth.guard";
-import { processAiQuery } from "./ai.service";
+import { getMyAiQuery, listMyAiQueries, processAiQuery } from "./ai.service";
 import { isSupportedAudioMime, translateAudioWithSarvam } from "./ai.sarvam";
 
 const aiRouter = Router();
@@ -20,8 +21,33 @@ const querySchema = z.object({
 aiRouter.post("/query", async (req, res, next) => {
   try {
     const { query } = querySchema.parse(req.body);
-    const result = await processAiQuery(query);
+    const result = await processAiQuery(query, req.user!.userId);
     res.status(200).json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+const historyQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).optional(),
+  pageSize: z.coerce.number().int().min(1).max(100).optional()
+});
+
+// Per-user, scoped query history.
+aiRouter.get("/queries", async (req, res, next) => {
+  try {
+    const { page, pageSize } = historyQuerySchema.parse(req.query);
+    const result = await listMyAiQueries({ userId: req.user!.userId, page, pageSize });
+    res.status(200).json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+aiRouter.get("/queries/:id", async (req, res, next) => {
+  try {
+    const entry = await getMyAiQuery(param(req.params.id), req.user!.userId);
+    res.status(200).json({ success: true, data: entry });
   } catch (error) {
     next(error);
   }

@@ -59,8 +59,8 @@ const ROLES: { name: string; description: string; permissions: string[] }[] = [
   },
   {
     name: "content_creator",
-    description: "Can create and manage own tasks",
-    permissions: ["create_tasks", "manage_ideation"]
+    description: "Can create and manage own tasks and query AI",
+    permissions: ["create_tasks", "manage_ideation", "query_ai"]
   }
 ];
 

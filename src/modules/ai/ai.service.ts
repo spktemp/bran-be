@@ -1,11 +1,27 @@
+import { env } from "../../config/env";
 import { prisma } from "../../lib/prisma";
 import { HttpError } from "../../utils/httpError";
 import { findTasksByUserAndDateRange } from "../tasks/tasks.repository";
+import { findAdhocWorkByUserAndDateRange } from "../adhoc-work/adhoc-work.repository";
+import { findWorkUnitsByUserAndDateRange } from "../work/work.repository";
 import {
   semanticSearchTasks,
+  semanticSearchAdhocWork,
+  semanticSearchWorkUnits,
   generatePerformanceReport,
-  embedAndUpsertTask
+  embedAndUpsertTask,
+  embedAndUpsertAdhocWork,
+  embedAndUpsertWorkUnit,
+  embedAndUpsertAiQuery,
+  semanticSearchAiQueryCache
 } from "./ai.embeddings";
+import {
+  createAiQuery,
+  findAiQueryById,
+  findReusableAiQuery,
+  listAiQueriesByUser,
+  type AiQueryScope
+} from "./ai.repository";
 
 interface QueryIntent {
   userName: string | null;
@@ -40,6 +56,20 @@ async function getActiveUsers(): Promise<CachedUser[]> {
 
   userCache = { at: now, users };
   return users;
+}
+
+async function resolveRequestingUser(
+  userId: string,
+  users: CachedUser[]
+): Promise<CachedUser | null> {
+  const cached = users.find((u) => u.id === userId);
+  if (cached) return cached;
+
+  // Already authenticated — resolve even if not in the active-user cache.
+  return prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, name: true, email: true }
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -136,6 +166,12 @@ function parseTimeRange(query: string): { from: Date; to: Date } {
 
 const TEAM_KEYWORDS = /\b(team|everyone|everybody|all\s+(?:users|members|staff|people)|whole\s+team|entire\s+team)\b/i;
 
+const SELF_REFERENTIAL = /\b(i|me|my|myself|mine)\b/i;
+
+function isSelfReferentialQuery(query: string): boolean {
+  return SELF_REFERENTIAL.test(query);
+}
+
 function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -227,16 +263,40 @@ function resolveUserFromQuery(query: string, users: CachedUser[]): CachedUser | 
   return best?.user ?? null;
 }
 
-function parseQueryIntent(query: string, users: CachedUser[]): QueryIntent {
+function parseQueryIntent(
+  query: string,
+  users: CachedUser[],
+  requestingUser?: CachedUser | null
+): QueryIntent {
   const timeRange = parseTimeRange(query);
 
   if (TEAM_KEYWORDS.test(query)) {
     return { userName: null, userId: null, scope: "team", timeRange };
   }
 
+  // Self-referential queries ("what did I do…") always map to the requester.
+  if (requestingUser && isSelfReferentialQuery(query)) {
+    return {
+      userName: requestingUser.name,
+      userId: requestingUser.id,
+      scope: "user",
+      timeRange
+    };
+  }
+
   const user = resolveUserFromQuery(query, users);
   if (user) {
     return { userName: user.name, userId: user.id, scope: "user", timeRange };
+  }
+
+  // Authenticated chat default: no named subject → report for the requester.
+  if (requestingUser) {
+    return {
+      userName: requestingUser.name,
+      userId: requestingUser.id,
+      scope: "user",
+      timeRange
+    };
   }
 
   return { userName: null, userId: null, scope: "user", timeRange };
@@ -247,37 +307,186 @@ function parseQueryIntent(query: string, users: CachedUser[]): QueryIntent {
 // ────────────────────────────────────────────────────────────────────────────
 
 const MAX_TASKS_FOR_LLM = 40;
+const MAX_ADHOC_FOR_LLM = 40;
+const MAX_WORK_FOR_LLM = 40;
 
-export async function processAiQuery(query: string) {
+/**
+ * Cache validity is keyed on the EXACT resolved date range. For ongoing
+ * periods (range still includes today) the underlying data can change — e.g.
+ * extra effort logged tomorrow — so we expire after a short TTL. For closed
+ * periods (range fully in the past) the data is stable and reusable forever.
+ * Different days resolve to different ranges, so a cached "this week" is never
+ * reused once the week or day rolls over.
+ */
+function computeCacheExpiry(rangeTo: Date, now: Date = new Date()): Date | null {
+  const startToday = startOfDay(now);
+  if (rangeTo.getTime() < startToday.getTime()) {
+    return null; // closed/historical period → stable
+  }
+  return new Date(now.getTime() + env.aiQueryCacheTtlMinutes * 60_000);
+}
+
+async function findCachedAnswer(params: {
+  normalizedQuery: string;
+  scope: AiQueryScope;
+  targetUserId: string | null;
+  rangeFrom: Date;
+  rangeTo: Date;
+}) {
+  // Prefer the semantic global cache (matches reworded questions); fall back to
+  // the exact DB lookup so repeats still hit when Pinecone is unavailable.
+  try {
+    const match = await semanticSearchAiQueryCache({
+      normalizedQuery: params.normalizedQuery,
+      scope: params.scope,
+      targetUserId: params.targetUserId,
+      rangeFrom: params.rangeFrom,
+      rangeTo: params.rangeTo,
+      minScore: env.aiQueryCacheSemanticThreshold
+    });
+    if (match) {
+      const row = await findAiQueryById(match.aiQueryId);
+      if (row && (!row.expiresAt || row.expiresAt.getTime() > Date.now())) {
+        return row;
+      }
+    }
+  } catch {
+    // Pinecone not configured / unreachable — degrade to exact lookup.
+  }
+
+  return findReusableAiQuery({
+    scope: params.scope,
+    targetUserId: params.targetUserId,
+    rangeFrom: params.rangeFrom,
+    rangeTo: params.rangeTo,
+    normalizedQuery: params.normalizedQuery
+  });
+}
+
+async function persistAndIndexAiQuery(input: {
+  requesterId: string | undefined;
+  rawQuery: string;
+  normalizedQuery: string;
+  scope: AiQueryScope;
+  targetUserId: string | null;
+  targetName: string | null;
+  rangeFrom: Date;
+  rangeTo: Date;
+  report: string;
+  meta: Record<string, unknown>;
+  cached: boolean;
+  expiresAt: Date | null;
+}): Promise<string | null> {
+  if (!input.requesterId) return null;
+
+  const saved = await createAiQuery({
+    userId: input.requesterId,
+    rawQuery: input.rawQuery,
+    normalizedQuery: input.normalizedQuery,
+    scope: input.scope,
+    targetUserId: input.targetUserId,
+    targetName: input.targetName,
+    rangeFrom: input.rangeFrom,
+    rangeTo: input.rangeTo,
+    report: input.report,
+    meta: input.meta,
+    cached: input.cached,
+    expiresAt: input.expiresAt
+  });
+
+  void embedAndUpsertAiQuery({
+    id: saved.id,
+    requesterId: saved.userId,
+    normalizedQuery: input.normalizedQuery,
+    scope: input.scope,
+    targetUserId: input.targetUserId,
+    rangeFrom: input.rangeFrom,
+    rangeTo: input.rangeTo,
+    expiresAt: input.expiresAt,
+    createdAt: saved.createdAt
+  }).catch((err) => console.error("[ai-index] Failed to index ai query:", saved.id, err));
+
+  return saved.id;
+}
+
+export async function processAiQuery(query: string, requestingUserId?: string) {
+  const rawQuery = query.trim();
+  const normalizedQuery = rawQuery.toLowerCase();
   const users = await getActiveUsers();
-  const intent = parseQueryIntent(query, users);
+  const requestingUser = requestingUserId
+    ? await resolveRequestingUser(requestingUserId, users)
+    : null;
+  const intent = parseQueryIntent(rawQuery, users, requestingUser);
 
   if (intent.scope === "user" && !intent.userId) {
     const sample = users.slice(0, 5).map((u) => u.name).join(", ");
     throw new HttpError(
       400,
-      `Could not identify a person in your query. Mention a name (e.g. "${sample || "Neha"}") or ask about the "team".`
+      `Could not identify a person in your query. Mention a name (e.g. "${sample || "Neha"}"), ask about yourself (e.g. "what did I do this week"), or ask about the "team".`
     );
   }
 
-  const userIds =
-    intent.scope === "team" ? users.map((u) => u.id) : [intent.userId as string];
-  const displayName =
-    intent.scope === "team" ? "Team" : (intent.userName as string);
+  const scope = intent.scope;
+  const targetUserId = scope === "team" ? null : (intent.userId as string);
+  const targetName = scope === "team" ? "Team" : (intent.userName as string);
+  const { from: rangeFrom, to: rangeTo } = intent.timeRange;
+
+  // ── Cache: reuse a prior answer for this exact range/scope/subject ────────
+  const cachedRow = await findCachedAnswer({
+    normalizedQuery,
+    scope,
+    targetUserId,
+    rangeFrom,
+    rangeTo
+  });
+
+  if (cachedRow) {
+    const cachedMeta =
+      cachedRow.meta != null ? (JSON.parse(cachedRow.meta) as Record<string, unknown>) : {};
+
+    const queryId = await persistAndIndexAiQuery({
+      requesterId: requestingUserId,
+      rawQuery,
+      normalizedQuery,
+      scope,
+      targetUserId,
+      targetName,
+      rangeFrom,
+      rangeTo,
+      report: cachedRow.report,
+      meta: { ...cachedMeta, cached: true },
+      cached: true,
+      expiresAt: cachedRow.expiresAt
+    });
+
+    return {
+      report: cachedRow.report,
+      meta: { ...cachedMeta, cached: true, sourceQueryId: cachedRow.id, queryId }
+    };
+  }
+
+  const userIds = scope === "team" ? users.map((u) => u.id) : [targetUserId as string];
+  const displayName = targetName;
 
   // Fan out all I/O in parallel — this is the biggest win for latency.
-  const [tasksByUser, socialStats, semanticContext] = await Promise.all([
-    fetchTasksForUsers(userIds, intent.timeRange.from, intent.timeRange.to),
-    fetchSocialStats(intent.timeRange.from, intent.timeRange.to),
-    fetchSemanticContext(query, intent.scope === "user" ? (intent.userId as string) : undefined)
+  const [tasksByUser, adhocByUser, workByUser, socialStats, semanticContext] = await Promise.all([
+    fetchTasksForUsers(userIds, rangeFrom, rangeTo),
+    fetchAdhocWorkForUsers(userIds, rangeFrom, rangeTo),
+    fetchWorkUnitsForUsers(userIds, rangeFrom, rangeTo, requestingUserId),
+    fetchSocialStats(rangeFrom, rangeTo),
+    fetchSemanticContext(normalizedQuery, scope === "user" ? (targetUserId as string) : undefined)
   ]);
 
   const tasks = tasksByUser.flat();
+  const adhocWork = adhocByUser.flat();
+  const workUnits = workByUser.flat();
   const stats = computeStats(tasks);
+  const adhocStats = computeAdhocStats(adhocWork);
+  const workStats = computeWorkStats(workUnits, rangeFrom, rangeTo);
 
   const report = await generatePerformanceReport({
     userName: displayName,
-    query,
+    query: rawQuery,
     tasks: tasks.slice(0, MAX_TASKS_FOR_LLM).map((t) => ({
       title: t.title,
       type: t.type,
@@ -288,24 +497,64 @@ export async function processAiQuery(query: string) {
       createdAt: t.createdAt,
       completedAt: t.completedAt
     })),
+    adhocWork: adhocWork.slice(0, MAX_ADHOC_FOR_LLM).map((entry) => ({
+      description: entry.description,
+      output: entry.output,
+      effortHours: entry.effortHours,
+      createdAt: entry.createdAt
+    })),
+    workUnits: workUnits.slice(0, MAX_WORK_FOR_LLM).map((unit) => ({
+      title: unit.title,
+      context: unit.context,
+      status: unit.status,
+      steps: unit.steps.map((step) => ({
+        description: step.description,
+        deadline: step.deadline
+      })),
+      createdAt: unit.createdAt
+    })),
     stats,
+    adhocStats,
+    workStats,
     socialStats,
     semanticContext
   });
 
+  const meta = {
+    user:
+      scope === "user"
+        ? { id: targetUserId, name: targetName }
+        : { id: null, name: "team", memberCount: users.length },
+    scope,
+    timeRange: intent.timeRange,
+    taskCount: tasks.length,
+    adhocWorkCount: adhocWork.length,
+    workUnitCount: workUnits.length,
+    hadSemanticContext: semanticContext.length > 0,
+    truncatedTasks: tasks.length > MAX_TASKS_FOR_LLM,
+    truncatedAdhocWork: adhocWork.length > MAX_ADHOC_FOR_LLM,
+    truncatedWorkUnits: workUnits.length > MAX_WORK_FOR_LLM
+  };
+
+  const expiresAt = computeCacheExpiry(rangeTo);
+  const queryId = await persistAndIndexAiQuery({
+    requesterId: requestingUserId,
+    rawQuery,
+    normalizedQuery,
+    scope,
+    targetUserId,
+    targetName,
+    rangeFrom,
+    rangeTo,
+    report,
+    meta,
+    cached: false,
+    expiresAt
+  });
+
   return {
     report,
-    meta: {
-      user:
-        intent.scope === "user"
-          ? { id: intent.userId, name: intent.userName }
-          : { id: null, name: "team", memberCount: users.length },
-      scope: intent.scope,
-      timeRange: intent.timeRange,
-      taskCount: tasks.length,
-      hadSemanticContext: semanticContext.length > 0,
-      truncatedTasks: tasks.length > MAX_TASKS_FOR_LLM
-    }
+    meta: { ...meta, cached: false, queryId }
   };
 }
 
@@ -322,6 +571,40 @@ async function fetchTasksForUsers(userIds: string[], from: Date, to: Date) {
     results.push(...batchResults);
   }
   return results;
+}
+
+async function fetchAdhocWorkForUsers(userIds: string[], from: Date, to: Date) {
+  const CONCURRENCY = 8;
+  const results: Awaited<ReturnType<typeof findAdhocWorkByUserAndDateRange>>[] = [];
+  for (let i = 0; i < userIds.length; i += CONCURRENCY) {
+    const batch = userIds.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map((id) => findAdhocWorkByUserAndDateRange(id, from, to))
+    );
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+async function fetchWorkUnitsForUsers(
+  userIds: string[],
+  from: Date,
+  to: Date,
+  requesterId?: string
+) {
+  const CONCURRENCY = 8;
+  const results: Awaited<ReturnType<typeof findWorkUnitsByUserAndDateRange>>[] = [];
+  for (let i = 0; i < userIds.length; i += CONCURRENCY) {
+    const batch = userIds.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map((id) => findWorkUnitsByUserAndDateRange(id, from, to))
+    );
+    results.push(...batchResults);
+  }
+
+  return results.map((units) =>
+    units.filter((unit) => !unit.isPrivate || unit.userId === requesterId)
+  );
 }
 
 async function fetchSocialStats(from: Date, to: Date) {
@@ -341,18 +624,81 @@ async function fetchSemanticContext(
   userId?: string
 ): Promise<Array<{ title: string; type: string; platform: string }>> {
   try {
-    const matches = await semanticSearchTasks(query, userId ? { userId } : undefined, 5);
-    return matches
+    const filters = userId ? { userId } : undefined;
+    const [taskMatches, adhocMatches, workMatches] = await Promise.all([
+      semanticSearchTasks(query, filters, 5),
+      semanticSearchAdhocWork(query, filters, 5),
+      semanticSearchWorkUnits(query, filters, 5)
+    ]);
+
+    const taskContext = taskMatches
       .filter((m) => m.metadata)
       .map((m) => ({
         title: String(m.metadata!.title ?? ""),
         type: String(m.metadata!.type ?? ""),
         platform: String(m.metadata!.platform ?? "")
       }));
+
+    const adhocContext = adhocMatches
+      .filter((m) => m.metadata)
+      .map((m) => ({
+        title: String(m.metadata!.title ?? ""),
+        type: "ADHOC",
+        platform: ""
+      }));
+
+    const workContext = workMatches
+      .filter((m) => m.metadata)
+      .map((m) => ({
+        title: String(m.metadata!.title ?? ""),
+        type: "WORK",
+        platform: ""
+      }));
+
+    return [...taskContext, ...adhocContext, ...workContext];
   } catch {
     // Pinecone may not be configured / reachable; degrade gracefully.
     return [];
   }
+}
+
+function computeAdhocStats(entries: Array<{ effortHours: number | null }>) {
+  return {
+    totalEntries: entries.length,
+    totalEffortHours: Number(
+      entries.reduce((sum, entry) => sum + (entry.effortHours ?? 0), 0).toFixed(2)
+    )
+  };
+}
+
+function computeWorkStats(
+  units: Array<{
+    status: string;
+    steps: Array<{ deadline: Date | null }>;
+  }>,
+  rangeFrom: Date,
+  rangeTo: Date
+) {
+  let upcomingDeadlines = 0;
+
+  for (const unit of units) {
+    for (const step of unit.steps) {
+      if (
+        step.deadline &&
+        step.deadline.getTime() >= rangeFrom.getTime() &&
+        step.deadline.getTime() <= rangeTo.getTime()
+      ) {
+        upcomingDeadlines += 1;
+      }
+    }
+  }
+
+  return {
+    totalUnits: units.length,
+    openUnits: units.filter((u) => u.status === "OPEN").length,
+    closedUnits: units.filter((u) => u.status === "CLOSED").length,
+    upcomingDeadlines
+  };
 }
 
 function computeStats(tasks: Array<{ status: string; platform?: string | null }>) {
@@ -375,6 +721,60 @@ function computeStats(tasks: Array<{ status: string; platform?: string | null }>
   }
 
   return stats;
+}
+
+export async function indexWorkUnitForSearch(unitId: string) {
+  const unit = await prisma.workUnit.findUnique({
+    where: { id: unitId },
+    include: {
+      user: { select: { id: true, name: true } },
+      steps: true
+    }
+  });
+
+  if (!unit) return;
+
+  try {
+    await embedAndUpsertWorkUnit({
+      id: unit.id,
+      userId: unit.userId,
+      userName: unit.user.name,
+      title: unit.title,
+      context: unit.context,
+      status: unit.status,
+      isPrivate: unit.isPrivate,
+      steps: unit.steps.map((step) => ({
+        description: step.description,
+        deadline: step.deadline
+      })),
+      createdAt: unit.createdAt
+    });
+  } catch (err) {
+    console.error("[ai-index] Failed to index work unit:", unitId, err);
+  }
+}
+
+export async function indexAdhocWorkForSearch(entryId: string) {
+  const entry = await prisma.adhocWork.findUnique({
+    where: { id: entryId },
+    include: { user: { select: { id: true, name: true } } }
+  });
+
+  if (!entry) return;
+
+  try {
+    await embedAndUpsertAdhocWork({
+      id: entry.id,
+      userId: entry.userId,
+      userName: entry.user.name,
+      description: entry.description,
+      output: entry.output,
+      effortHours: entry.effortHours,
+      createdAt: entry.createdAt
+    });
+  } catch (err) {
+    console.error("[ai-index] Failed to index adhoc work:", entryId, err);
+  }
 }
 
 export async function indexTaskForSearch(taskId: string) {
@@ -400,6 +800,71 @@ export async function indexTaskForSearch(taskId: string) {
   } catch (err) {
     console.error("[ai-index] Failed to index task:", taskId, err);
   }
+}
+
+function parseStoredMeta(meta: string | null): unknown {
+  if (!meta) return null;
+  try {
+    return JSON.parse(meta);
+  } catch {
+    return null;
+  }
+}
+
+export async function listMyAiQueries(options: {
+  userId: string;
+  page?: number;
+  pageSize?: number;
+}) {
+  const page = Math.max(1, Number(options.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(options.pageSize) || 20));
+
+  const { items, total } = await listAiQueriesByUser({ userId: options.userId, page, pageSize });
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  return {
+    items: items.map((row) => ({
+      id: row.id,
+      query: row.rawQuery,
+      scope: row.scope,
+      target: row.targetUserId ? { id: row.targetUserId, name: row.targetName } : null,
+      timeRange: { from: row.rangeFrom, to: row.rangeTo },
+      report: row.report,
+      meta: parseStoredMeta(row.meta),
+      cached: row.cached,
+      expiresAt: row.expiresAt,
+      createdAt: row.createdAt
+    })),
+    pagination: { page, pageSize, total, totalPages, hasNextPage: page < totalPages }
+  };
+}
+
+export async function getMyAiQuery(id: string, userId: string) {
+  const row = await findAiQueryById(id);
+  if (!row || row.userId !== userId) {
+    throw new HttpError(404, "Query not found");
+  }
+  return {
+    id: row.id,
+    query: row.rawQuery,
+    scope: row.scope,
+    target: row.targetUserId ? { id: row.targetUserId, name: row.targetName } : null,
+    timeRange: { from: row.rangeFrom, to: row.rangeTo },
+    report: row.report,
+    meta: parseStoredMeta(row.meta),
+    cached: row.cached,
+    expiresAt: row.expiresAt,
+    createdAt: row.createdAt
+  };
+}
+
+// Exported for tests
+export function _parseQueryIntentForTests(
+  query: string,
+  users: CachedUser[],
+  requestingUser?: CachedUser | null
+): QueryIntent {
+  return parseQueryIntent(query, users, requestingUser);
 }
 
 // Exported for tests / cache invalidation hooks

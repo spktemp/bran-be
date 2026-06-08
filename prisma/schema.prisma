@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlserver"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -12,7 +12,7 @@ datasource db {
 model Role {
   id          String   @id @default(uuid())
   name        String   @unique
-  description String?  @db.NVarChar(500)
+  description String?  @db.VarChar(500)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -23,7 +23,7 @@ model Role {
 model Permission {
   id          String  @id @default(uuid())
   name        String  @unique
-  description String? @db.NVarChar(500)
+  description String? @db.VarChar(500)
 
   roles RolePermission[]
 }
@@ -43,11 +43,11 @@ model User {
   googleId     String?
   email        String    @unique
   name         String
-  avatarUrl    String?   @db.NVarChar(1000)
-  description  String?   @db.NVarChar(2000)
+  avatarUrl    String?   @db.VarChar(1000)
+  description  String?   @db.VarChar(2000)
   phone        String?
   designation  String?
-  passwordHash String?   @db.NVarChar(500)
+  passwordHash String?   @db.VarChar(500)
   roleId       String
   isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
@@ -73,6 +73,9 @@ model User {
   notifications             Notification[]          @relation("NotificationRecipient")
   ideas                     Idea[]                  @relation("IdeaAuthor")
   matchedIdeaRecommendations IdeaMatch[]            @relation("IdeaMatchTargetUser")
+  adhocWork                 AdhocWork[]
+  aiQueries                 AiQuery[]               @relation("AiQueryRequester")
+  workUnits                 WorkUnit[]              @relation("WorkUnitOwner")
 
   @@index([roleId])
   @@index([email])
@@ -85,7 +88,7 @@ model Vertical {
   id          String   @id @default(uuid())
   name        String   @unique
   slug        String   @unique
-  description String?  @db.NVarChar(2000)
+  description String?  @db.VarChar(2000)
   ownerUserId String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -101,7 +104,7 @@ model Vertical {
 model Team {
   id          String   @id @default(uuid())
   name        String
-  description String?  @db.NVarChar(2000)
+  description String?  @db.VarChar(2000)
   verticalId  String
   createdById String?
   isActive    Boolean  @default(true)
@@ -140,9 +143,9 @@ model TeamMember {
 model Project {
   id          String    @id @default(uuid())
   name        String
-  description String?   @db.NVarChar(2000)
-  objectives  String?   @db.NVarChar(Max)
-  finalLink   String?   @db.NVarChar(2000)
+  description String?   @db.VarChar(2000)
+  objectives  String?   @db.Text
+  finalLink   String?   @db.VarChar(2000)
   verticalId  String
   createdById String?
   status      String    @default("ACTIVE")
@@ -167,7 +170,7 @@ model ProjectPhase {
   id         String    @id @default(uuid())
   projectId  String
   name       String
-  objectives String?   @db.NVarChar(Max)
+  objectives String?   @db.Text
   deadline   DateTime?
   status     String    @default("PLANNED")
   orderIndex Int       @default(0)
@@ -205,13 +208,13 @@ model ProjectMember {
 model Task {
   id          String    @id @default(uuid())
   userId      String
-  title       String    @db.NVarChar(500)
-  description String?   @db.NVarChar(4000)
+  title       String    @db.VarChar(500)
+  description String?   @db.VarChar(4000)
   type        String    @default("GENERAL")
   platform    String?
-  contentUrl  String?   @db.NVarChar(2000)
+  contentUrl  String?   @db.VarChar(2000)
   status      String    @default("PENDING")
-  metadata    String?   @db.NVarChar(Max)
+  metadata    String?   @db.Text
   dueDate     DateTime?
   completedAt DateTime?
   createdAt   DateTime  @default(now())
@@ -226,14 +229,100 @@ model Task {
   @@index([type, platform])
 }
 
+// ── Adhoc Work ──────────────────────────────────────────────
+
+model AdhocWork {
+  id          String   @id @default(uuid())
+  userId      String
+  description String   @db.Text
+  output      String?  @db.Text
+  effortHours Float?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId])
+  @@index([userId, createdAt])
+}
+
+// ── Work Units ──────────────────────────────────────────────
+
+model WorkUnit {
+  id         String    @id @default(uuid())
+  userId     String
+  title      String    @db.VarChar(500)
+  context    String    @db.Text
+  status     String    @default("OPEN") // OPEN | CLOSED
+  isPrivate  Boolean   @default(false)
+  closedAt   DateTime?
+  nextDueAt  DateTime?
+  firstDueAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  user  User       @relation("WorkUnitOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  steps WorkStep[]
+
+  @@index([userId])
+  @@index([userId, createdAt])
+  @@index([status])
+  @@index([isPrivate])
+  @@index([nextDueAt])
+  @@index([firstDueAt])
+  @@index([closedAt])
+}
+
+model WorkStep {
+  id          String    @id @default(uuid())
+  workUnitId  String
+  description String    @db.Text
+  deadline    DateTime?
+  done        Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+
+  workUnit WorkUnit @relation(fields: [workUnitId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([workUnitId])
+  @@index([deadline])
+}
+
+// ── AI Query History & Cache ────────────────────────────────
+
+model AiQuery {
+  id              String    @id @default(uuid())
+  userId          String
+  rawQuery        String    @db.Text
+  normalizedQuery String    @db.VarChar(1000)
+  scope           String // 'user' | 'team'
+  targetUserId    String?
+  targetName      String?
+  rangeFrom       DateTime
+  rangeTo         DateTime
+  report          String    @db.Text
+  meta            String?   @db.Text
+  // True when this row's answer was served from the global cache instead of recomputed.
+  cached          Boolean   @default(false)
+  // null = closed/historical period (stable, reusable indefinitely);
+  // a timestamp = ongoing period whose underlying data can still change.
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+
+  user User @relation("AiQueryRequester", fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId, createdAt])
+  @@index([scope, targetUserId, rangeFrom, rangeTo])
+  @@index([normalizedQuery])
+}
+
 // ── Ideation ────────────────────────────────────────────────
 
 model Idea {
   id          String    @id @default(uuid())
   authorId    String
-  title       String    @db.NVarChar(500)
-  description String    @db.NVarChar(Max)
-  tags        String?   @db.NVarChar(2000)
+  title       String    @db.VarChar(500)
+  description String    @db.Text
+  tags        String?   @db.VarChar(2000)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
@@ -298,7 +387,7 @@ model InstagramPerformance {
   engagementRate  Float    @default(0)
   sentiment       String   @default("unknown")
   mentionedAt     DateTime
-  rawPayload      String   @db.NVarChar(Max)
+  rawPayload      String   @db.Text
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -312,8 +401,8 @@ model InstagramPerformance {
 
 model Content {
   id          String   @id @default(uuid())
-  title       String   @db.NVarChar(500)
-  description String?  @db.NVarChar(2000)
+  title       String   @db.VarChar(500)
+  description String?  @db.VarChar(2000)
   type        String // 'PRODUCTION' | 'COVERAGE'
   status      String   @default("DRAFT") // DRAFT | IN_PROGRESS | COMPLETED | ARCHIVED
   teamId      String
@@ -338,10 +427,10 @@ model ContentNode {
   id          String    @id @default(uuid())
   contentId   String
   kind        String // 'SCRIPTING' | 'SHOOT' | 'EDITING' | ...
-  name        String    @db.NVarChar(500)
+  name        String    @db.VarChar(500)
   orderIndex  Int       @default(0)
   status      String    @default("PENDING") // PENDING | IN_PROGRESS | BLOCKED | COMPLETED
-  notes       String?   @db.NVarChar(Max)
+  notes       String?   @db.Text
   startsAt    DateTime?
   dueDate     DateTime?
   completedAt DateTime?
@@ -375,13 +464,13 @@ model ContentNodeTeamMember {
 model ContentNodeOutput {
   id                String    @id @default(uuid())
   nodeId            String
-  label             String    @db.NVarChar(500)
-  url               String    @db.NVarChar(2000)
-  notes             String?   @db.NVarChar(Max)
+  label             String    @db.VarChar(500)
+  url               String    @db.VarChar(2000)
+  notes             String?   @db.Text
   version           Int       @default(1)
   submittedByUserId String?
   approvalState     String    @default("PENDING") // PENDING | IN_REVIEW | CHANGES_REQUESTED | APPROVED | REJECTED
-  reviewNote        String?   @db.NVarChar(2000)
+  reviewNote        String?   @db.VarChar(2000)
   reviewedByUserId  String?
   reviewedAt        DateTime?
   createdAt         DateTime  @default(now())
@@ -398,15 +487,15 @@ model ContentNodeOutput {
 model ContentNodeResource {
   id                String    @id @default(uuid())
   nodeId            String
-  name              String    @db.NVarChar(500)
+  name              String    @db.VarChar(500)
   sourceType        String    @default("IN_HOUSE") // IN_HOUSE | RENTAL
   cost              Decimal?  @db.Decimal(18, 2)
   quantity          Int       @default(1)
   currency          String?
-  notes             String?   @db.NVarChar(Max)
+  notes             String?   @db.Text
   // Rental-only review workflow. IN_HOUSE rows stay APPROVED implicitly.
   approvalState     String    @default("PENDING") // PENDING | APPROVED | REJECTED
-  reviewNote        String?   @db.NVarChar(2000)
+  reviewNote        String?   @db.VarChar(2000)
   requestedByUserId String?
   reviewedByUserId  String?
   reviewedAt        DateTime?
@@ -428,12 +517,12 @@ model Notification {
   id          String    @id @default(uuid())
   userId      String
   kind        String // e.g. CONTENT_NODE_READY
-  title       String    @db.NVarChar(500)
-  body        String?   @db.NVarChar(Max)
+  title       String    @db.VarChar(500)
+  body        String?   @db.Text
   // JSON-encoded structured payload (output, fromNode, toNode, contentId, ...)
-  data        String?   @db.NVarChar(Max)
+  data        String?   @db.Text
   // Idempotency key so the same trigger never produces duplicate rows.
-  dedupeKey   String?   @db.NVarChar(500)
+  dedupeKey   String?   @db.VarChar(500)
   readAt      DateTime?
   emailSentAt DateTime?
   createdAt   DateTime  @default(now())

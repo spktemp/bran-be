@@ -12,10 +12,6 @@ const teamPreview = {
   select: { id: true, name: true, verticalId: true }
 } as const;
 
-const projectPreview = {
-  select: { id: true, name: true, verticalId: true, status: true }
-} as const;
-
 const resourceInclude = {
   requestedBy: userPreview,
   reviewedBy: userPreview
